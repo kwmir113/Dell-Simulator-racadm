@@ -19,6 +19,14 @@ fault-injection engine as before (failed DIMM, GPU fallen off the bus, PSU
 failure, crashed NIC driver, stuck iDRAC job, outdated firmware, failing
 NVMe drive, failed fan).
 
+There's also a fleet-wide OS upgrade workflow (`osupgrade fleet` /
+`osupgrade status` at the fleet console, `do-release-upgrade` on a
+connected server) that rolls out a new Ubuntu Server release across every
+server, gated behind the same fault model -- a server with an active
+critical hardware fault blocks the upgrade until it's fixed. See
+`ansible/` for the real Ansible dynamic inventory + playbook this maps to
+against an actual fleet.
+
 Each server's state is created lazily the first time it's touched (via
 `connect` or `scenario fleet`), so the simulator stays lightweight even
 though the addressable fleet is large.
@@ -41,6 +49,8 @@ Then try:
     exit
     scenario fleet 3
     alerts
+    osupgrade fleet
+    osupgrade status
 """
 
 from __future__ import annotations
@@ -137,6 +147,30 @@ def validate_location(loc: Location) -> Optional[str]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# OS release model
+#
+# CURRENT_OS_VERSION is the baseline every server starts on.
+# TARGET_OS_VERSION is the release `osupgrade fleet` / `do-release-upgrade`
+# rolls out ("24.04 - U3" == the third Ubuntu 24.04 point release).
+#
+# FLEET_OS_VERSION is the fleet-wide baseline image: any server that gets
+# touched for the first time (via `connect` or `scenario fleet`) is created
+# already running whatever FLEET_OS_VERSION currently is -- the same
+# "untouched servers are implicitly healthy" trick the fault engine uses,
+# applied to OS version instead of hardware health.
+# ---------------------------------------------------------------------------
+
+CURRENT_OS_VERSION = "Ubuntu Server 22.04.5 LTS (Jammy Jellyfish)"
+TARGET_OS_VERSION = "Ubuntu Server 24.04.3 LTS (Noble Numbat)"
+FLEET_OS_VERSION = CURRENT_OS_VERSION
+
+# Active faults of these kinds represent hardware you cannot safely reboot
+# through (or that iDRAC-mediated actions may not complete cleanly with),
+# so they block an OS upgrade until fixed -- mirrors a real pre-flight
+# health check gate in front of a fleet OS rollout.
+OS_UPGRADE_BLOCKING_FAULTS = {"dimm_ecc", "gpu_bus", "psu_fail", "fan_fail"}
+
 # Sparse: only servers that have been connected to or fault-seeded exist here.
 FLEET: dict = {}
 
@@ -164,6 +198,7 @@ def fresh_state() -> dict:
         "bios_version_latest": "2.6.1",
         "idrac_version": "7.10.30.00",
         "idrac_version_latest": "7.10.30.00",
+        "os_version": FLEET_OS_VERSION,
         "boot_time": now,
         "cpus": [
             {"id": "CPU.Socket.1", "model": "Intel Xeon Platinum 8462Y+", "cores": 32, "status": "Ok"},
@@ -492,6 +527,8 @@ Available commands (type `help <topic>` for details):
   OS shell           nvidia-smi [-r], lspci, dmesg, dmidecode -t memory,
                       free -h, lscpu, df -h, ip a, ipmitool sel list,
                       systemctl status|restart <service>, uptime
+  OS release          cat /etc/os-release, apt update, apt list --upgradable,
+                      do-release-upgrade  (upgrade this one server)
   Maintenance        service reseat <component> <id>
                       service replace <component> <id>
   Session            exit / disconnect (back to fleet console)
@@ -524,7 +561,12 @@ df -h                  Filesystem usage
 ip a                   Network interface status
 ipmitool sel list      Alternate view of the System Event Log
 systemctl status|restart <service>   e.g. `systemctl restart networking`
-uptime                 Server uptime""",
+uptime                 Server uptime
+cat /etc/os-release    Show the installed OS release
+apt update             Check for pending OS updates
+apt list --upgradable  List what would be upgraded
+do-release-upgrade     Upgrade this server to the target OS release
+                        (blocked while a critical hardware fault is active)""",
         "service": """\
 service reseat <component> <id>    Simulate physically reseating a part
 service replace <component> <id>   Simulate physically replacing a part
@@ -552,6 +594,7 @@ def cmd_status(args, state):
         f"Overall Health  : {health}",
         f"BIOS Version    : {state['bios_version']}",
         f"iDRAC Version   : {state['idrac_version']}",
+        f"OS Version      : {state['os_version']}",
     ]
     if issues:
         lines.append("")
@@ -865,6 +908,67 @@ def os_uptime(state):
     return f"up {int(delta.total_seconds())} seconds, simulated session"
 
 
+# --- OS release / upgrade --------------------------------------------------
+
+
+def os_upgrade_blocked(state) -> Optional[str]:
+    """Return a reason string if a critical hardware fault should block an
+    OS upgrade/reboot on this server, or None if it's clear to proceed."""
+    for key, entry in state["active_faults"].items():
+        if key in OS_UPGRADE_BLOCKING_FAULTS:
+            return f"active critical hardware fault '{entry['def'].title}' (id: {key}) must be resolved first"
+    return None
+
+
+def os_release_file(state):
+    return f'NAME="Ubuntu"\nPRETTY_NAME="{state["os_version"]}"\nID=ubuntu'
+
+
+def os_apt(state, args):
+    sub = args[0] if args else ""
+    pending = state["os_version"] != TARGET_OS_VERSION
+    if sub == "update":
+        if pending:
+            return (
+                "Reading package lists... Done\n"
+                f"{random.randint(3, 40)} packages can be upgraded.\n"
+                f"A new release, '{TARGET_OS_VERSION}', is available. Run `do-release-upgrade`."
+            )
+        return "Reading package lists... Done\nAll packages are up to date."
+    if sub == "list" and "--upgradable" in args:
+        if not pending:
+            return "Listing... Done"
+        return (
+            "Listing... Done\n"
+            f"ubuntu-release-upgrader-core/noble  [upgradable to: {TARGET_OS_VERSION}]"
+        )
+    return "Usage: apt update | apt list --upgradable"
+
+
+def os_do_release_upgrade(state):
+    if state["os_version"] == TARGET_OS_VERSION:
+        return f"Checking for a new Ubuntu release\nNo new release found. Already running {TARGET_OS_VERSION}."
+    reason = os_upgrade_blocked(state)
+    if reason:
+        return (
+            "Checking for a new Ubuntu release\n"
+            f"New release '{TARGET_OS_VERSION}' available.\n"
+            f"Aborting: {reason}.\n"
+            "Resolve it (see `faults`) and re-run `do-release-upgrade`."
+        )
+    from_ver = state["os_version"]
+    state["os_version"] = TARGET_OS_VERSION
+    add_sel(state, "Info", f"OS: upgraded from {from_ver} to {TARGET_OS_VERSION} (do-release-upgrade)")
+    return (
+        "Checking for a new Ubuntu release\n"
+        f"New release '{TARGET_OS_VERSION}' available.\n"
+        "Fetching and installing packages ... done.\n"
+        "Restarting services ... done.\n"
+        "Rebooting to complete the upgrade ... done.\n"
+        f"System upgraded: {from_ver} -> {TARGET_OS_VERSION}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fault progress tracking
 # ---------------------------------------------------------------------------
@@ -975,6 +1079,12 @@ def dispatch(line, state):
         output = os_systemctl(state, args)
     elif head == "uptime":
         output = os_uptime(state)
+    elif head == "cat" and args[:1] == ["/etc/os-release"]:
+        output = os_release_file(state)
+    elif head == "apt":
+        output = os_apt(state, args)
+    elif head in ("do-release-upgrade", "os-upgrade") or (head == "os" and args[:1] == ["upgrade"]):
+        output = os_do_release_upgrade(state)
     else:
         output = f"bash: {head}: command not found. Type `help` for the command list."
 
@@ -1057,6 +1167,8 @@ Fleet console -- browse the hierarchy, then connect to one server at a time.
   connect <dc> <dh> <pod> <rack> <srv>       Open a session on one server
   alerts                                     Fleet-wide list of active faults
   scenario fleet [n]                         Seed n random faults across the fleet (default 3)
+  osupgrade fleet                            Roll out {TARGET_OS_VERSION} fleet-wide
+  osupgrade status                           Show fleet OS baseline / rollout progress
   quit / exit                                Exit the simulator
 
 `connect` also accepts a single token, e.g. `connect DC1-DH03-POD12-RACK05-SRV07`.
@@ -1195,6 +1307,100 @@ def cmd_scenario_fleet(args):
     )
 
 
+def cmd_osupgrade_fleet(args):
+    """Roll the target OS release out fleet-wide.
+
+    Untouched/uninitialized servers are implicitly re-imaged: the fleet-wide
+    baseline (FLEET_OS_VERSION) flips to TARGET_OS_VERSION, so any server
+    connected to for the first time from now on already has it. Servers
+    already touched/initialized this session are walked and upgraded one
+    by one, unless a critical hardware fault blocks them -- printed in an
+    ansible-playbook-flavored PLAY RECAP, since this is exactly the kind of
+    rollout a real Ansible playbook (see ansible/playbooks/upgrade_os.yml)
+    would drive against an actual fleet.
+    """
+    global FLEET_OS_VERSION
+    already_baseline = FLEET_OS_VERSION == TARGET_OS_VERSION
+    FLEET_OS_VERSION = TARGET_OS_VERSION
+
+    host_lines = []
+    ok = changed = failed = 0
+    fail_rows = []
+    for lid, st in sorted(FLEET.items()):
+        if st["os_version"] == TARGET_OS_VERSION:
+            host_lines.append(f"ok: [{lid}]")
+            ok += 1
+            continue
+        reason = os_upgrade_blocked(st)
+        if reason:
+            host_lines.append(f'failed: [{lid}] => {{"msg": "{reason}"}}')
+            failed += 1
+            fail_rows.append((lid, reason))
+            continue
+        from_ver = st["os_version"]
+        st["os_version"] = TARGET_OS_VERSION
+        add_sel(st, "Info", f"OS: upgraded from {from_ver} to {TARGET_OS_VERSION} via fleet-wide rollout")
+        host_lines.append(f"changed: [{lid}]")
+        changed += 1
+
+    touched = len(FLEET)
+    lines = [
+        "PLAY [xe9640_fleet_os_upgrade] " + "*" * 46,
+        "",
+        "TASK [Gathering Facts] " + "*" * 54,
+    ]
+    lines += [f"ok: [{lid}]" for lid in sorted(FLEET.keys())] or [
+        "(no servers touched/initialized yet this session)"
+    ]
+    lines.append("")
+    lines.append(f"TASK [os_upgrade : apply {TARGET_OS_VERSION}] " + "*" * 10)
+    lines += host_lines or ["(nothing to do -- baseline image updated for future connections)"]
+    lines.append("")
+    lines.append("PLAY RECAP " + "*" * 60)
+    lines.append(f"touched={touched}  ok={ok}  changed={changed}  unreachable=0  failed={failed}  skipped=0")
+    lines.append("")
+    if already_baseline and touched == 0:
+        lines.append(f"Fleet baseline was already {TARGET_OS_VERSION}; nothing changed.")
+    else:
+        lines.append(
+            f"Fleet-wide OS baseline is now {TARGET_OS_VERSION}. Any server connected to for the "
+            "first time from now on is already imaged with it."
+        )
+    if fail_rows:
+        lines.append("")
+        lines.append("Blocked hosts (fix the hardware fault, then `osupgrade fleet` again, or")
+        lines.append("`connect` to that server and run `do-release-upgrade` directly):")
+        for lid, reason in fail_rows:
+            lines.append(f"  {lid}: {reason}")
+    return "\n".join(lines)
+
+
+def cmd_osupgrade_status(args):
+    if not FLEET:
+        return (
+            f"Fleet OS baseline (applies to any server on first connect): {FLEET_OS_VERSION}\n"
+            "No servers touched/initialized this session yet."
+        )
+    on_target = sum(1 for st in FLEET.values() if st["os_version"] == TARGET_OS_VERSION)
+    blocked = [
+        (lid, os_upgrade_blocked(st))
+        for lid, st in sorted(FLEET.items())
+        if st["os_version"] != TARGET_OS_VERSION and os_upgrade_blocked(st)
+    ]
+    lines = [
+        f"Fleet OS baseline (applies to any server on first connect): {FLEET_OS_VERSION}",
+        f"Servers touched this session          : {len(FLEET)}",
+        f"  on {TARGET_OS_VERSION}: {on_target}",
+        f"  pending upgrade                      : {len(FLEET) - on_target}",
+    ]
+    if blocked:
+        lines.append("")
+        lines.append("Blocked by an active critical hardware fault:")
+        for lid, reason in blocked:
+            lines.append(f"  {lid}: {reason}")
+    return "\n".join(lines)
+
+
 def run_server_session(args):
     """Connect to exactly one server and run its shell until `exit`/`disconnect`
     (returns to the fleet console) or `quit` (raised as SystemExit, propagated
@@ -1292,6 +1498,12 @@ def main():
             print(cmd_scenario_fleet(args[1:]))
         elif head == "scenario":
             print("Usage: scenario fleet [n]  (or `connect <server>` first, then `scenario start` on that server)")
+        elif head == "osupgrade" and args[:1] == ["fleet"]:
+            print(cmd_osupgrade_fleet(args[1:]))
+        elif head == "osupgrade" and args[:1] == ["status"]:
+            print(cmd_osupgrade_status(args[1:]))
+        elif head == "osupgrade":
+            print("Usage: osupgrade fleet | osupgrade status")
         else:
             print(f"Unknown command '{head}'. Type `help` for the fleet console command list.")
 
